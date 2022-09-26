@@ -10,6 +10,10 @@ import sys
 import contextlib
 import logging
 # external
+import threading
+import typing
+
+import numba, timeit
 import numpy as np
 import pandas as pd
 import h5py
@@ -185,6 +189,7 @@ def read_bruker_sql(
     with sqlite3.connect(
         os.path.join(bruker_d_folder_name, "analysis.tdf")
     ) as sql_database_connection:
+        # breakpoint()
         global_meta_data = pd.read_sql_query(
             "SELECT * from GlobalMetaData",
             sql_database_connection
@@ -359,9 +364,39 @@ def parse_decompressed_bruker_binary_type1(
     return scan_size
 
 
+def process_frames(
+    frame_range: range,
+    tdf_bin_file_name: str,
+    tims_offset_values: np.ndarray,
+    scan_indptr: np.ndarray,
+    intensities: np.ndarray,
+    tof_indices: np.ndarray,
+    frame_indptr: np.ndarray,
+    max_scan_count: int,
+    compression_type: int,
+    max_peaks_per_scan: int,
+):
+    start = timeit.default_timer()
+    print(f'{threading.get_ident()=}\t{start=}\t{frame_range=}')
+    with open(tdf_bin_file_name, "rb") as infile:
+        for frame_id in frame_range:
+            process_frame(frame_id, infile,
+                          tims_offset_values,
+                          scan_indptr,
+                          intensities,
+                          tof_indices,
+                          frame_indptr,
+                          max_scan_count,
+                          compression_type,
+                          max_peaks_per_scan,
+                          )
+    total = timeit.default_timer() - start
+    print(f'{threading.get_ident()=}\t{timeit.default_timer()=}\t{total=}\t{len(frame_range)=}\t{frame_range=}')
+
 def process_frame(
     frame_id: int,
-    tdf_bin_file_name: str,
+    # tdf_bin_file_name: str,
+    infile: typing.BinaryIO,
     tims_offset_values: np.ndarray,
     scan_indptr: np.ndarray,
     intensities: np.ndarray,
@@ -417,69 +452,69 @@ def process_frame(
         The maximum number of peaks per scan.
         Should be retrieved from the global metadata.
     """
-    with open(tdf_bin_file_name, "rb") as infile:
-        frame_start = frame_indptr[frame_id]
-        frame_end = frame_indptr[frame_id + 1]
-        if frame_start != frame_end:
-            offset = tims_offset_values[frame_id]
-            infile.seek(offset)
-            bin_size = int.from_bytes(infile.read(4), "little")
-            scan_count = int.from_bytes(infile.read(4), "little")
-            max_peak_count = min(
-                max_peaks_per_scan,
-                frame_end - frame_start
+    # with open(tdf_bin_file_name, "rb") as infile:
+    frame_start = frame_indptr[frame_id]
+    frame_end = frame_indptr[frame_id + 1]
+    if frame_start != frame_end:
+        offset = tims_offset_values[frame_id]
+        infile.seek(offset)
+        bin_size = int.from_bytes(infile.read(4), "little")
+        scan_count = int.from_bytes(infile.read(4), "little")
+        max_peak_count = min(
+            max_peaks_per_scan,
+            frame_end - frame_start
+        )
+        if compression_type == 1:
+            import lzf
+            compression_offset = 8 + (scan_count + 1) * 4
+            scan_offsets = np.frombuffer(
+                infile.read((scan_count + 1) * 4),
+                dtype=np.int32
+            ) - compression_offset
+            compressed_data = infile.read(bin_size - compression_offset)
+            scan_indices_ = np.zeros(scan_count, dtype=np.int64)
+            tof_indices_ = np.empty(
+                frame_end - frame_start,
+                dtype=np.uint32
             )
-            if compression_type == 1:
-                import lzf
-                compression_offset = 8 + (scan_count + 1) * 4
-                scan_offsets = np.frombuffer(
-                    infile.read((scan_count + 1) * 4),
-                    dtype=np.int32
-                ) - compression_offset
-                compressed_data = infile.read(bin_size - compression_offset)
-                scan_indices_ = np.zeros(scan_count, dtype=np.int64)
-                tof_indices_ = np.empty(
-                    frame_end - frame_start,
-                    dtype=np.uint32
+            intensities_ = np.empty(
+                frame_end - frame_start,
+                dtype=np.uint16
+            )
+            scan_start = 0
+            for scan_index in range(scan_count):
+                start = scan_offsets[scan_index]
+                end = scan_offsets[scan_index + 1]
+                if start == end:
+                    continue
+                decompressed_bytes = lzf.decompress(
+                    compressed_data[start: end],
+                    max_peak_count * 4 * 2
                 )
-                intensities_ = np.empty(
-                    frame_end - frame_start,
-                    dtype=np.uint16
-                )
-                scan_start = 0
-                for scan_index in range(scan_count):
-                    start = scan_offsets[scan_index]
-                    end = scan_offsets[scan_index + 1]
-                    if start == end:
-                        continue
-                    decompressed_bytes = lzf.decompress(
-                        compressed_data[start: end],
-                        max_peak_count * 4 * 2
-                    )
-                    scan_start += parse_decompressed_bruker_binary_type1(
-                        decompressed_bytes,
-                        scan_indices_,
-                        tof_indices_,
-                        intensities_,
-                        scan_start,
-                        scan_index,
-                    )
-            elif compression_type == 2:
-                import pyzstd
-                compressed_data = infile.read(bin_size - 8)
-                decompressed_bytes = pyzstd.decompress(compressed_data)
-                (
+                scan_start += parse_decompressed_bruker_binary_type1(
+                    decompressed_bytes,
                     scan_indices_,
                     tof_indices_,
-                    intensities_
-                ) = parse_decompressed_bruker_binary_type2(decompressed_bytes)
-            else:
-                raise ValueError("TimsCompressionType is not 1 or 2.")
-            scan_start = frame_id * max_scan_count
-            scan_end = scan_start + scan_count
-            scan_indptr[scan_start: scan_end] = scan_indices_
-            tof_indices[frame_start: frame_end] = tof_indices_
-            intensities[frame_start: frame_end] = intensities_
+                    intensities_,
+                    scan_start,
+                    scan_index,
+                )
+        elif compression_type == 2:
+            import pyzstd
+            compressed_data = infile.read(bin_size - 8)
+            decompressed_bytes = pyzstd.decompress(compressed_data)
+            (
+                scan_indices_,
+                tof_indices_,
+                intensities_
+            ) = parse_decompressed_bruker_binary_type2(decompressed_bytes)
+        else:
+            raise ValueError("TimsCompressionType is not 1 or 2.")
+        scan_start = frame_id * max_scan_count
+        scan_end = scan_start + scan_count
+        scan_indptr[scan_start: scan_end] = scan_indices_
+        tof_indices[frame_start: frame_end] = tof_indices_
+        intensities[frame_start: frame_end] = intensities_
 
 
 def read_bruker_binary(
@@ -531,15 +566,22 @@ def read_bruker_binary(
         f"Reading {frame_indptr.size - 2:,} frames with "
         f"{frame_indptr[-1]:,} detector events for {bruker_d_folder_name}"
     )
+    frame_partition = np.searchsorted(tims_offset_values, np.linspace(0, tims_offset_values[-1], 4 * alphatims.utils.MAX_THREADS + 1))
+    frame_partition[-1] = len(tims_offset_values)
+    frame_ranges = [range(start, stop) for start, stop in zip(frame_partition[:-1], frame_partition[1:])]
+    import multiprocessing
+    print(f'{len(frame_ranges)=}')
     if compression_type == 1:
         process_frame_func = alphatims.utils.threadpool(
-            process_frame,
+            process_frames,
             thread_count=1
         )
     else:
-        process_frame_func = alphatims.utils.threadpool(process_frame)
+        process_frame_func = alphatims.utils.threadpool(process_frames)
+    start = timeit.default_timer()
     process_frame_func(
-        range(1, len(frames)),
+        frame_ranges,
+        # range(1, len(frames)),
         tdf_bin_file_name,
         tims_offset_values,
         scan_indptr,
@@ -550,6 +592,7 @@ def read_bruker_binary(
         compression_type,
         max_peaks_per_scan,
     )
+    print(f'{timeit.default_timer()-start=}')
     scan_indptr[1:] = np.cumsum(scan_indptr[:-1])
     scan_indptr[0] = 0
     return scan_indptr, tof_indices, intensities
@@ -1040,6 +1083,10 @@ class TimsTOF(object):
         )
         # Precompile
         self[0, "raw"]
+        self[:400.5, 500:700, 0, 400.0: 400.5, [50, 87, 116]]
+        self[{"frame_indices": [1, 191], "scan_indices": slice(300, 800, 10), "mz_values": slice(None, 400.5),
+              "intensity_values": 50, }]
+        # breakpoint()
         logging.info(f"Successfully imported data from {bruker_d_folder_name}")
 
     def __len__(self):
@@ -1124,6 +1171,10 @@ class TimsTOF(object):
                     ),
                     self.scan_max_index
                 )
+                # print(f'{mobility_estimation_from_frame=}')
+                # print(f'{indices=}')
+                # print(f'{self.mobility_values=}')
+                # breakpoint()
         else:
             if (mobility_estimation_from_frame != 0):
                 logging.info(
@@ -1167,9 +1218,20 @@ class TimsTOF(object):
             self._mz_values = (
                 tof_intercept + tof_slope * np.arange(self.tof_max_index)
             )**2
+        # breakpoint()
         self._parse_quad_indptr()
+        start=timeit.default_timer()
         self._intensity_min_value = int(np.min(self.intensity_values))
+        p1 = timeit.default_timer()
         self._intensity_max_value = int(np.max(self.intensity_values))
+        p2 = timeit.default_timer()
+        print(f'min time\t{p1-start}')
+        print(f'max time\t{p2-p1}')
+        print(f'total\t{p2-start}')
+        for i in range(0):
+            start = timeit.default_timer()
+            self._intensity_min_value, self._intensity_max_value = eeeeeee(self.intensity_values)
+            print(f'total\t{timeit.default_timer() - start}')
 
     def save_as_hdf(
         self,
@@ -1566,6 +1628,7 @@ class TimsTOF(object):
             tof_indices=self.tof_indices,
             intensities=self.intensity_values
         )
+        # breakpoint()
         if as_dataframe:
             return self.as_dataframe(raw_indices)
         else:
@@ -1885,6 +1948,7 @@ class TimsTOF(object):
             ]
         )
         self._precursor_max_index = int(np.max(self.precursor_indices)) + 1
+        # breakpoint()
         if self._acquisition_mode == "diaPASEF":
             offset = int(self.zeroth_frame)
             cycle_index = np.searchsorted(
@@ -2871,6 +2935,10 @@ def valid_precursor_index(
     )
 
 
+@numba.njit
+def eeeeeee(intensity_values:np.ndarray):
+    return int(np.min(intensity_values)), int(np.max(intensity_values))
+
 @alphatims.utils.njit
 def filter_indices(
     frame_slices: np.ndarray,
@@ -2951,15 +3019,16 @@ def filter_indices(
         frame_max_index,
         scan_max_index
     )
+    # breakpoint()
     for frame_start, frame_stop, frame_step in frame_slices:
         for frame_start_slice, frame_end_slice in zip(
-            starts[slice(frame_start, frame_stop, frame_step)],
-            ends[slice(frame_start, frame_stop, frame_step)]
+            starts[frame_start: frame_stop: frame_step],
+            ends[frame_start: frame_stop: frame_step]
         ):
             for scan_start, scan_stop, scan_step in scan_slices:
                 for sparse_start, sparse_end in zip(
-                    frame_start_slice[slice(scan_start, scan_stop, scan_step)],
-                    frame_end_slice[slice(scan_start, scan_stop, scan_step)]
+                    frame_start_slice[scan_start: scan_stop: scan_step],
+                    frame_end_slice[scan_start: scan_stop: scan_step]
                 ):
                     if (sparse_start == sparse_end):
                         continue
