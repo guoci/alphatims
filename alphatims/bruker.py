@@ -532,27 +532,55 @@ def read_bruker_binary(
         f"Reading {frame_indptr.size - 2:,} frames with "
         f"{frame_indptr[-1]:,} detector events for {bruker_d_folder_name}"
     )
-    if compression_type == 1:
-        process_frame_func = alphatims.utils.threadpool(
-            process_frame,
-            thread_count=1
+
+    with_ext_parser: bool = False
+    if compression_type == 2 and sys.platform == 'linux':
+        import ctypes
+        scan_indptr = np.zeros(scan_count + 1, dtype=np.int64)
+        parser_dll = ctypes.cdll.LoadLibrary(os.path.realpath(
+            os.path.join(alphatims.utils.EXT_PATH, 'libparse_bruker_binary_lib.so')
+        ))
+        parser_dll.parse_bruker_binary.argtypes = [ctypes.POINTER(ctypes.c_int64), ctypes.POINTER(ctypes.c_int64),
+                                                   ctypes.POINTER(ctypes.c_int64),
+                                                   ctypes.c_uint64, ctypes.c_char_p,
+                                                   ctypes.POINTER(ctypes.c_int64), ctypes.c_uint64,
+                                                   ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint32)]
+        parser_dll.parse_bruker_binary.restype = None
+        assert frames.NumPeaks.dtype == np.dtype('int64')
+        assert frames.TimsId.dtype == np.dtype('int64')
+        parser_dll.parse_bruker_binary(frames.NumScans.values.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                       frames.NumPeaks.values.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                       frames.TimsId.values.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                       ctypes.c_uint64(len(frames.TimsId)),
+                                       ctypes.c_char_p(bruker_d_folder_name.encode()),
+                                       scan_indptr.ctypes.data_as(ctypes.POINTER(ctypes.c_int64)),
+                                       ctypes.c_uint64(len(scan_indptr)),
+                                       intensities.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+                                       tof_indices.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)))
+        with_ext_parser = True
+
+    if not with_ext_parser:
+        if compression_type == 1:
+            process_frame_func = alphatims.utils.threadpool(
+                process_frame,
+                thread_count=1
+            )
+        else:
+            process_frame_func = alphatims.utils.threadpool(process_frame)
+        process_frame_func(
+            range(1, len(frames)),
+            tdf_bin_file_name,
+            tims_offset_values,
+            scan_indptr,
+            intensities,
+            tof_indices,
+            frame_indptr,
+            max_scan_count,
+            compression_type,
+            max_peaks_per_scan,
         )
-    else:
-        process_frame_func = alphatims.utils.threadpool(process_frame)
-    process_frame_func(
-        range(1, len(frames)),
-        tdf_bin_file_name,
-        tims_offset_values,
-        scan_indptr,
-        intensities,
-        tof_indices,
-        frame_indptr,
-        max_scan_count,
-        compression_type,
-        max_peaks_per_scan,
-    )
-    scan_indptr[1:] = np.cumsum(scan_indptr[:-1])
-    scan_indptr[0] = 0
+        scan_indptr[1:] = np.cumsum(scan_indptr[:-1])
+        scan_indptr[0] = 0
     return scan_indptr, tof_indices, intensities
 
 
